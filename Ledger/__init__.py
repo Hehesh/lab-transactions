@@ -62,6 +62,7 @@ class Ledger:
             sql = sql.bindparams(account_id=account_id)
             logging.debug(sql)
             self.connection.execute(sql)
+
     def transfer_funds(
             self,
             debit_account_id,
@@ -70,34 +71,91 @@ class Ledger:
             ):
         '''
         Records the transfer and updates both account balances.
+
+        The transaction is retried if PostgreSQL detects a deadlock.
         '''
-        with self.connection.begin():
-            sql = text('LOCK TABLE balances IN ACCESS EXCLUSIVE MODE;')
-            logging.debug(sql)
-            self.connection.execute(sql)
 
-            # insert the transaction
-            sql = text('INSERT INTO transactions (debit_account_id, credit_account_id, amount) '
-                       'VALUES (:debit_account_id, :credit_account_id, :amount);')
-            logging.debug(sql)
-            self.connection.execute(sql, {
-                'debit_account_id': debit_account_id,
-                'credit_account_id': credit_account_id,
-                'amount': amount,
-            })
+        while True:
+            try:
+                with self.connection.begin():
 
-            # update the debit account balance
-            sql = text('SELECT balance FROM balances WHERE account_id = :id;')
-            logging.debug(sql)
-            debit_account_balance = self.connection.execute(sql, {'id': debit_account_id}).first()[0]
-            sql = text('UPDATE balances SET balance = :balance WHERE account_id = :id;')
-            logging.debug(sql)
-            self.connection.execute(sql, {'balance': debit_account_balance - amount, 'id': debit_account_id})
+                    # Insert the transaction record.
+                    sql = text(
+                        'INSERT INTO transactions '
+                        '(debit_account_id, credit_account_id, amount) '
+                        'VALUES (:debit_account_id, :credit_account_id, :amount);'
+                    )
+                    logging.debug(sql)
+                    self.connection.execute(sql, {
+                        'debit_account_id': debit_account_id,
+                        'credit_account_id': credit_account_id,
+                        'amount': amount,
+                    })
 
-            # update the credit account balance
-            sql = text('SELECT balance FROM balances WHERE account_id = :id;')
-            logging.debug(sql)
-            credit_account_balance = self.connection.execute(sql, {'id': credit_account_id}).first()[0]
-            sql = text('UPDATE balances SET balance = :balance WHERE account_id = :id;')
-            logging.debug(sql)
-            self.connection.execute(sql, {'balance': credit_account_balance + amount, 'id': credit_account_id})
+                    # Lock and read the debit account balance.
+                    sql = text(
+                        'SELECT balance '
+                        'FROM balances '
+                        'WHERE account_id = :id '
+                        'FOR UPDATE;'
+                    )
+                    logging.debug(sql)
+                    debit_account_balance = self.connection.execute(
+                        sql,
+                        {'id': debit_account_id}
+                    ).scalar_one()
+
+                    # Update the debit account balance.
+                    sql = text(
+                        'UPDATE balances '
+                        'SET balance = :balance '
+                        'WHERE account_id = :id;'
+                    )
+                    logging.debug(sql)
+                    self.connection.execute(sql, {
+                        'balance': debit_account_balance - amount,
+                        'id': debit_account_id,
+                    })
+
+                    # Lock and read the credit account balance.
+                    sql = text(
+                        'SELECT balance '
+                        'FROM balances '
+                        'WHERE account_id = :id '
+                        'FOR UPDATE;'
+                    )
+                    logging.debug(sql)
+                    credit_account_balance = self.connection.execute(
+                        sql,
+                        {'id': credit_account_id}
+                    ).scalar_one()
+
+                    # Update the credit account balance.
+                    sql = text(
+                        'UPDATE balances '
+                        'SET balance = :balance '
+                        'WHERE account_id = :id;'
+                    )
+                    logging.debug(sql)
+                    self.connection.execute(sql, {
+                        'balance': credit_account_balance + amount,
+                        'id': credit_account_id,
+                    })
+
+                # The transaction committed successfully.
+                break
+
+            except sqlalchemy.exc.OperationalError as error:
+                # PostgreSQL uses SQLSTATE 40P01 for deadlocks.
+                original_error = error.orig
+                error_code = (
+                    getattr(original_error, 'pgcode', None)
+                    or getattr(original_error, 'sqlstate', None)
+                )
+
+                if error_code != '40P01':
+                    raise
+
+                logging.warning(
+                    'Deadlock detected while transferring funds; retrying'
+                )
