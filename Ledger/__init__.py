@@ -28,10 +28,11 @@ class Ledger:
         '''
         This function is used inside of the random_transfers.py script.
         '''
-        sql = text('SELECT account_id FROM accounts;')
-        logging.debug(sql)
-        results = self.connection.execute(sql)
-        return [row[0] for row in results.all()]
+        with self.connection.begin():
+            sql = text('SELECT account_id FROM accounts;')
+            logging.debug(sql)
+            results = self.connection.execute(sql)
+            return [row[0] for row in results.all()]
 
     def create_account(self, name):
         '''
@@ -70,59 +71,29 @@ class Ledger:
         '''
         Records the transfer and updates both account balances.
         '''
-
-        try:
-            # Insert the transaction record.
-            sql = text('''
-                INSERT INTO transactions
-                    (debit_account_id, credit_account_id, amount)
-                VALUES
-                    (:debit_account_id, :credit_account_id, :amount);
-            ''')
+        with self.connection.begin():
+            # insert the transaction
+            sql = text('INSERT INTO transactions (debit_account_id, credit_account_id, amount) '
+                       'VALUES (:debit_account_id, :credit_account_id, :amount);')
             logging.debug(sql)
-            self.connection.execute(
-                sql,
-                {
-                    'debit_account_id': debit_account_id,
-                    'credit_account_id': credit_account_id,
-                    'amount': amount,
-                }
-            )
+            self.connection.execute(sql, {
+                'debit_account_id': debit_account_id,
+                'credit_account_id': credit_account_id,
+                'amount': amount,
+            })
 
-            # Debit the source account.
-            sql = text('''
-                UPDATE balances
-                SET balance = balance - :amount
-                WHERE account_id = :account_id;
-            ''')
+            # update the debit account balance
+            sql = text('SELECT balance FROM balances WHERE account_id = :id;')
             logging.debug(sql)
-            self.connection.execute(
-                sql,
-                {
-                    'amount': amount,
-                    'account_id': debit_account_id,
-                }
-            )
-
-            # Credit the destination account.
-            sql = text('''
-                UPDATE balances
-                SET balance = balance + :amount
-                WHERE account_id = :account_id;
-            ''')
+            debit_account_balance = self.connection.execute(sql, {'id': debit_account_id}).first()[0]
+            sql = text('UPDATE balances SET balance = :balance WHERE account_id = :id;')
             logging.debug(sql)
-            self.connection.execute(
-                sql,
-                {
-                    'amount': amount,
-                    'account_id': credit_account_id,
-                }
-            )
+            self.connection.execute(sql, {'balance': debit_account_balance - amount, 'id': debit_account_id})
 
-            # Commit only after all operations succeed.
-            self.connection.commit()
-
-        except Exception:
-            # Roll back the entire transfer if any operation fails.
-            self.connection.rollback()
-            raise
+            # update the credit account balance
+            sql = text('SELECT balance FROM balances WHERE account_id = :id;')
+            logging.debug(sql)
+            credit_account_balance = self.connection.execute(sql, {'id': credit_account_id}).first()[0]
+            sql = text('UPDATE balances SET balance = :balance WHERE account_id = :id;')
+            logging.debug(sql)
+            self.connection.execute(sql, {'balance': credit_account_balance + amount, 'id': credit_account_id})
